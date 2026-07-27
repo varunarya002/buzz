@@ -226,7 +226,8 @@ buzz messages thread \
 buzz messages search --query "Hello" | jq .
 buzz messages search --query "CLI test" --limit 5 | jq .
 
-# messages edit
+# messages edit (existing attachments are preserved by default;
+#   --file replaces them, --no-media clears them)
 buzz messages edit --event "$EVENT_ID" --content "Edited by CLI test" | jq .
 
 # messages delete
