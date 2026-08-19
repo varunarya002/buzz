@@ -2441,7 +2441,7 @@ mod tests {
         );
     }
 
-// ── projects update mutation group ────────────────────────────────────────
+    // ── projects update mutation group ────────────────────────────────────────
 
     /// Multiple independent fields must be accepted in the same invocation.
     #[test]
