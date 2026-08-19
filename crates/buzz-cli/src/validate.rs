@@ -483,7 +483,10 @@ mod tests {
         // test runner's stdin is empty (or closed), so `read_to_string` returns
         // Ok("") — the point is that the result is *not* the literal "-".
         let got = super::read_or_stdin("-").unwrap();
-        assert_ne!(got, "-", "`-` must be treated as a stdin marker, not content");
+        assert_ne!(
+            got, "-",
+            "`-` must be treated as a stdin marker, not content"
+        );
     }
 
     // --- read_file_or_stdin ---
