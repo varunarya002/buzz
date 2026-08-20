@@ -109,6 +109,28 @@ async fn fetch_event_by_id(
         .ok_or_else(|| CliError::Other(format!("event {event_id} not found")))
 }
 
+/// Fetch the target plus its newest edit candidates in one relay round-trip.
+async fn fetch_event_with_edits(
+    client: &BuzzClient,
+    event_id: &str,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), CliError> {
+    let target_filter = serde_json::json!({"ids": [event_id], "limit": 1});
+    let edits_filter = serde_json::json!({
+        "kinds": [40003],
+        "#e": [event_id],
+        "limit": 100,
+    });
+    let raw = client.query_multi(&[target_filter, edits_filter]).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+    let target = events
+        .iter()
+        .find(|event| event.get("id").and_then(|value| value.as_str()) == Some(event_id))
+        .cloned()
+        .ok_or_else(|| CliError::Other(format!("event {event_id} not found")))?;
+    Ok((target, events))
+}
+
 /// Extract the channel UUID from an event's h-tag.
 fn channel_id_from_event(event: &serde_json::Value, event_id: &str) -> Result<Uuid, CliError> {
     let tags = event
@@ -181,6 +203,50 @@ fn extract_imeta_tags(event: &serde_json::Value) -> Vec<Vec<String>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Return the event whose attachment set is currently authoritative.
+///
+/// Kind-40003 edits replace the full imeta set, including an empty set. The
+/// desktop renderer chooses the first edit at the greatest `created_at`, so
+/// this helper uses the same strict-greater tie behavior over relay order.
+fn effective_media_source<'a>(
+    original: &'a serde_json::Value,
+    events: &'a [serde_json::Value],
+) -> &'a serde_json::Value {
+    let Some(target_id) = original.get("id").and_then(|value| value.as_str()) else {
+        return original;
+    };
+    let mut selected = original;
+    let mut selected_at = 0;
+    for event in events {
+        if event.get("kind").and_then(|value| value.as_u64()) != Some(40003) {
+            continue;
+        }
+        let targets_original = event
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .is_some_and(|tags| {
+                tags.iter().any(|tag| {
+                    tag.as_array().is_some_and(|parts| {
+                        parts.first().and_then(|value| value.as_str()) == Some("e")
+                            && parts.get(1).and_then(|value| value.as_str()) == Some(target_id)
+                    })
+                })
+            });
+        if !targets_original {
+            continue;
+        }
+        let created_at = event
+            .get("created_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if std::ptr::eq(selected, original) || created_at > selected_at {
+            selected = event;
+            selected_at = created_at;
+        }
+    }
+    selected
 }
 
 /// Resolve mention text against the channel membership snapshot.
@@ -867,9 +933,10 @@ pub async fn cmd_edit_message(
     let content = read_or_stdin(content)?;
     validate_content_size(&content)?;
 
-    // Fetch the target event once; derive both the channel id and the
-    // carry-forward attachment set from that single query.
-    let target_event = fetch_event_by_id(client, event_id).await?;
+    // Fetch the original and its recent edits in one query. A prior edit's
+    // attachment set is authoritative, including an empty set from
+    // `--no-media`; falling back to the original would resurrect removed files.
+    let (target_event, related_events) = fetch_event_with_edits(client, event_id).await?;
     let channel_uuid = channel_id_from_event(&target_event, event_id)?;
     let target_eid = parse_event_id(event_id)?;
 
@@ -903,7 +970,10 @@ pub async fn cmd_edit_message(
         (media_tags, final_content)
     } else {
         // Default: preserve existing attachments.
-        (extract_imeta_tags(&target_event), content.to_string())
+        (
+            extract_imeta_tags(effective_media_source(&target_event, &related_events)),
+            content.to_string(),
+        )
     };
 
     let builder = buzz_sdk::build_edit(channel_uuid, target_eid, &final_content, &media_tags)
@@ -1080,9 +1150,9 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, extract_imeta_tags, find_root_from_tags, match_profiles_by_name,
-        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        effective_media_source, event_mention_pubkeys, extract_imeta_tags, find_root_from_tags,
+        match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1496,5 +1566,45 @@ mod tests {
         let event = json!({});
         let imeta_tags = extract_imeta_tags(&event);
         assert!(imeta_tags.is_empty());
+    }
+
+    #[test]
+    fn effective_media_source_uses_latest_edit_even_when_it_clears_media() {
+        let original = json!({
+            "id": ID_A,
+            "kind": 9,
+            "created_at": 10,
+            "tags": [["imeta", "url original", "m image/png", "x hash", "size 1"]],
+        });
+        let cleared = json!({
+            "id": ID_B,
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A]],
+        });
+        let events = [original.clone(), cleared.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), cleared.get("id"));
+        assert!(extract_imeta_tags(source).is_empty());
+    }
+
+    #[test]
+    fn effective_media_source_uses_newest_edit_attachment_set() {
+        let original = json!({"id": ID_A, "kind": 9, "created_at": 10, "tags": []});
+        let older = json!({
+            "id": "old-edit",
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A], ["imeta", "url old"]],
+        });
+        let newer = json!({
+            "id": "new-edit",
+            "kind": 40003,
+            "created_at": 30,
+            "tags": [["e", ID_A], ["imeta", "url new"]],
+        });
+        let events = [newer.clone(), older, original.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), newer.get("id"));
     }
 }
