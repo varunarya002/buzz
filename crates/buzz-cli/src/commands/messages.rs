@@ -86,6 +86,15 @@ async fn resolve_thread_ref(
 /// Resolve the channel UUID for an event by querying for it via POST /query.
 /// Extracts the `h` tag value from the returned event's tags.
 async fn resolve_channel_id(client: &BuzzClient, event_id: &str) -> Result<Uuid, CliError> {
+    let event = fetch_event_by_id(client, event_id).await?;
+    channel_id_from_event(&event, event_id)
+}
+
+/// Fetch a single event by its ID via POST /query.
+async fn fetch_event_by_id(
+    client: &BuzzClient,
+    event_id: &str,
+) -> Result<serde_json::Value, CliError> {
     let filter = serde_json::json!({
         "ids": [event_id]
     });
@@ -95,9 +104,35 @@ async fn resolve_channel_id(client: &BuzzClient, event_id: &str) -> Result<Uuid,
     let arr = events
         .as_array()
         .ok_or_else(|| CliError::Other("query response is not an array".into()))?;
-    let event = arr
-        .first()
+    arr.first()
+        .cloned()
+        .ok_or_else(|| CliError::Other(format!("event {event_id} not found")))
+}
+
+/// Fetch the target plus its newest edit candidates in one relay round-trip.
+async fn fetch_event_with_edits(
+    client: &BuzzClient,
+    event_id: &str,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), CliError> {
+    let target_filter = serde_json::json!({"ids": [event_id], "limit": 1});
+    let edits_filter = serde_json::json!({
+        "kinds": [40003],
+        "#e": [event_id],
+        "limit": 100,
+    });
+    let raw = client.query_multi(&[target_filter, edits_filter]).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+    let target = events
+        .iter()
+        .find(|event| event.get("id").and_then(|value| value.as_str()) == Some(event_id))
+        .cloned()
         .ok_or_else(|| CliError::Other(format!("event {event_id} not found")))?;
+    Ok((target, events))
+}
+
+/// Extract the channel UUID from an event's h-tag.
+fn channel_id_from_event(event: &serde_json::Value, event_id: &str) -> Result<Uuid, CliError> {
     let tags = event
         .get("tags")
         .and_then(|t| t.as_array())
@@ -147,6 +182,89 @@ fn resolve_names_to_pubkeys(
         }
     }
     Ok(resolved)
+}
+
+/// Match the SDK/relay contract for a single raw `imeta` tag.
+fn is_valid_imeta(parts: &[String]) -> bool {
+    parts.first().map(String::as_str) == Some("imeta")
+        && ["url", "m", "x", "size"].iter().all(|required| {
+            parts.iter().skip(1).any(|part| {
+                part.split_once(' ')
+                    .is_some_and(|(key, value)| key == *required && !value.is_empty())
+            })
+        })
+}
+
+/// Extract valid raw `imeta` tag vectors from a fetched event's JSON tags.
+/// Malformed legacy vectors are omitted so a text-only edit cannot fail SDK
+/// validation while trying to carry attachments forward.
+fn extract_imeta_tags(event: &serde_json::Value) -> Vec<Vec<String>> {
+    event
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let parts = tag.as_array()?;
+                    let strings = parts
+                        .iter()
+                        .map(|part| part.as_str().map(String::from))
+                        .collect::<Option<Vec<_>>>()?;
+                    is_valid_imeta(&strings).then_some(strings)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Return the event whose attachment set is currently authoritative.
+///
+/// Kind-40003 edits replace the full imeta set, including an empty set. The
+/// desktop renderer chooses the first edit at the greatest `created_at`, so
+/// this helper uses the same strict-greater tie behavior over relay order.
+fn effective_media_source<'a>(
+    original: &'a serde_json::Value,
+    events: &'a [serde_json::Value],
+) -> &'a serde_json::Value {
+    let Some(target_id) = original.get("id").and_then(|value| value.as_str()) else {
+        return original;
+    };
+    let mut selected = original;
+    let mut selected_at = 0;
+    for event in events {
+        if event.get("kind").and_then(|value| value.as_u64()) != Some(40003) {
+            continue;
+        }
+        // Match the desktop overlay contract: the last valid `e` tag is the
+        // edit target. The relay's `#e` query is intentionally broad, so an
+        // earlier matching tag must not make an edit authoritative here.
+        let targets_original = event
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .and_then(|tags| {
+                tags.iter().rev().find_map(|tag| {
+                    let parts = tag.as_array()?;
+                    let candidate = parts.get(1)?.as_str()?;
+                    (parts.first()?.as_str()? == "e"
+                        && candidate.len() == 64
+                        && candidate.chars().all(|ch| ch.is_ascii_hexdigit()))
+                    .then_some(candidate)
+                })
+            })
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(target_id));
+        if !targets_original {
+            continue;
+        }
+        let created_at = event
+            .get("created_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if std::ptr::eq(selected, original) || created_at > selected_at {
+            selected = event;
+            selected_at = created_at;
+        }
+    }
+    selected
 }
 
 /// Resolve mention text against the channel membership snapshot.
@@ -812,19 +930,71 @@ pub async fn cmd_delete_message(
 }
 
 /// Edit a message you previously sent.
+///
+/// Attachment semantics:
+/// - No `--file` and no `--no-media`: preserves existing attachments (default carry-forward)
+/// - `--file` provided: replaces attachments with the uploaded file(s) and appends markdown
+/// - `--no-media`: removes all attachments from the message
 pub async fn cmd_edit_message(
     client: &BuzzClient,
     event_id: &str,
     content: &str,
+    files: &[String],
+    no_media: bool,
 ) -> Result<(), CliError> {
     validate_hex64(event_id)?;
-    validate_content_size(content)?;
+    // Mirror `cmd_send_message`: `--content -` reads the replacement body
+    // from stdin, so multiline answers and shell-metacharacter-heavy text
+    // don't need to be jammed through argv. Without this, a literal "-"
+    // silently replaces the message with a single dash and the edit
+    // publishes with `accepted: true`.
+    let content = read_or_stdin(content)?;
+    validate_content_size(&content)?;
 
-    // Resolve channel_id from the event's h-tag
-    let channel_uuid = resolve_channel_id(client, event_id).await?;
+    // Fetch the original and its recent edits in one query. A prior edit's
+    // attachment set is authoritative, including an empty set from
+    // `--no-media`; falling back to the original would resurrect removed files.
+    let (target_event, related_events) = fetch_event_with_edits(client, event_id).await?;
+    let channel_uuid = channel_id_from_event(&target_event, event_id)?;
     let target_eid = parse_event_id(event_id)?;
 
-    let builder = buzz_sdk::build_edit(channel_uuid, target_eid, content)
+    // Decide media_tags and final_content based on flags.
+    let (media_tags, final_content) = if no_media {
+        // --no-media: clear all attachments.
+        (Vec::new(), content.to_string())
+    } else if !files.is_empty() {
+        // --file provided: upload files and replace attachments.
+        let mut media_tags: Vec<Vec<String>> = Vec::new();
+        let mut media_content = String::new();
+        for file_path in files {
+            let desc = client
+                .upload_file(file_path)
+                .await
+                .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
+            media_tags.push(crate::client::build_imeta_tag(&desc));
+            if desc.mime_type.starts_with("video/") {
+                media_content.push_str("\n![video](");
+            } else {
+                media_content.push_str("\n![image](");
+            }
+            media_content.push_str(&desc.url);
+            media_content.push(')');
+        }
+        let final_content = if media_content.is_empty() {
+            content.to_string()
+        } else {
+            format!("{}{media_content}", content)
+        };
+        (media_tags, final_content)
+    } else {
+        // Default: preserve existing attachments.
+        (
+            extract_imeta_tags(effective_media_source(&target_event, &related_events)),
+            content.to_string(),
+        )
+    };
+
+    let builder = buzz_sdk::build_edit(channel_uuid, target_eid, &final_content, &media_tags)
         .map_err(|e| CliError::Other(format!("build_edit failed: {e}")))?;
 
     let event = client.sign_event(builder)?;
@@ -928,7 +1098,12 @@ pub async fn dispatch(
             )
             .await
         }
-        MessagesCmd::Edit { event, content } => cmd_edit_message(client, &event, &content).await,
+        MessagesCmd::Edit {
+            event,
+            content,
+            files,
+            no_media,
+        } => cmd_edit_message(client, &event, &content, &files, no_media).await,
         MessagesCmd::Delete {
             event,
             action_id,
@@ -993,9 +1168,9 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        effective_media_source, event_mention_pubkeys, extract_imeta_tags, find_root_from_tags,
+        match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1371,5 +1546,114 @@ mod tests {
             profile_event(PK_VALID_A, Some("Aaron"), None),
         ];
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
+    }
+
+    #[test]
+    fn extract_imeta_tags_returns_only_valid_imeta() {
+        let valid = json!([
+            "imeta",
+            "url https://example.com/image.png",
+            "m image/png",
+            "x deadbeef",
+            "size 123"
+        ]);
+        let event = json!({
+            "tags": [
+                ["h", "channel-uuid"],
+                ["e", "event-id", "", "reply"],
+                valid.clone(),
+                ["emoji", "🎉"],
+                ["imeta", "url", "https://example.com/legacy.png", "m", "image/png"],
+                ["imeta", "url https://example.com/no-size.png", "m image/png", "x cafe"]
+            ]
+        });
+        assert_eq!(
+            extract_imeta_tags(&event),
+            vec![valid
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()]
+        );
+    }
+
+    #[test]
+    fn extract_imeta_tags_empty_when_none() {
+        let event = json!({
+            "tags": [
+                ["h", "channel-uuid"],
+                ["e", "event-id"],
+            ]
+        });
+        let imeta_tags = extract_imeta_tags(&event);
+        assert!(imeta_tags.is_empty());
+    }
+
+    #[test]
+    fn extract_imeta_tags_handles_missing_tags() {
+        let event = json!({});
+        let imeta_tags = extract_imeta_tags(&event);
+        assert!(imeta_tags.is_empty());
+    }
+
+    #[test]
+    fn effective_media_source_uses_latest_edit_even_when_it_clears_media() {
+        let original = json!({
+            "id": ID_A,
+            "kind": 9,
+            "created_at": 10,
+            "tags": [["imeta", "url original", "m image/png", "x hash", "size 1"]],
+        });
+        let cleared = json!({
+            "id": ID_B,
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A]],
+        });
+        let events = [original.clone(), cleared.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), cleared.get("id"));
+        assert!(extract_imeta_tags(source).is_empty());
+    }
+
+    #[test]
+    fn effective_media_source_uses_newest_edit_attachment_set() {
+        let original = json!({"id": ID_A, "kind": 9, "created_at": 10, "tags": []});
+        let older = json!({
+            "id": "old-edit",
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A], ["imeta", "url old"]],
+        });
+        let newer = json!({
+            "id": "new-edit",
+            "kind": 40003,
+            "created_at": 30,
+            "tags": [["e", ID_A], ["imeta", "url new"]],
+        });
+        let events = [newer.clone(), older, original.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), newer.get("id"));
+    }
+
+    #[test]
+    fn effective_media_source_uses_the_renderers_last_valid_edit_target() {
+        let original = json!({"id": ID_A, "kind": 9, "created_at": 10, "tags": []});
+        let valid = json!({
+            "id": "valid-edit",
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A], ["imeta", "url valid"]],
+        });
+        let targets_another_message = json!({
+            "id": "other-target-edit",
+            "kind": 40003,
+            "created_at": 30,
+            "tags": [["e", ID_A], ["e", ID_B], ["imeta", "url wrong"]],
+        });
+        let events = [targets_another_message, valid.clone(), original.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), valid.get("id"));
     }
 }

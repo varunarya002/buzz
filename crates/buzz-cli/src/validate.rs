@@ -166,16 +166,23 @@ pub fn sdk_err(e: buzz_sdk::SdkError) -> CliError {
 
 /// Read content from a string value or stdin if the value is "-".
 pub fn read_or_stdin(value: &str) -> Result<String, CliError> {
-    if value == "-" {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| CliError::Other(format!("failed to read stdin: {e}")))?;
-        Ok(buf)
-    } else {
-        Ok(value.to_string())
+    let stdin = std::io::stdin();
+    read_or_reader(value, &mut stdin.lock())
+}
+
+/// Reader-backed implementation for [`read_or_stdin`].
+///
+/// Keeping the I/O source injectable lets tests prove the `-` contract
+/// without consuming or blocking on the test process's real stdin.
+fn read_or_reader(value: &str, reader: &mut impl std::io::Read) -> Result<String, CliError> {
+    if value != "-" {
+        return Ok(value.to_string());
     }
+    let mut buf = String::new();
+    reader
+        .read_to_string(&mut buf)
+        .map_err(|e| CliError::Other(format!("failed to read stdin: {e}")))?;
+    Ok(buf)
 }
 
 /// Read content from a file path, or stdin if the value is "-".
@@ -474,6 +481,26 @@ mod tests {
     #[test]
     fn read_or_stdin_passthrough_empty_string() {
         assert_eq!(super::read_or_stdin("").unwrap(), "");
+    }
+
+    #[test]
+    fn read_or_stdin_dash_reads_the_supplied_reader() {
+        // Regression for the edit-vs-send mismatch in #4361. Exercise the
+        // reader seam instead of consuming or blocking on the test process's
+        // real stdin.
+        let mut input = std::io::Cursor::new(b"replacement from stdin\n".to_vec());
+        let got = super::read_or_reader("-", &mut input).unwrap();
+        assert_eq!(got, "replacement from stdin\n");
+    }
+
+    #[test]
+    fn read_or_reader_does_not_touch_reader_for_literal_content() {
+        let mut input = std::io::Cursor::new(b"must remain unread".to_vec());
+        assert_eq!(
+            super::read_or_reader("literal", &mut input).unwrap(),
+            "literal"
+        );
+        assert_eq!(input.position(), 0);
     }
 
     // --- read_file_or_stdin ---
