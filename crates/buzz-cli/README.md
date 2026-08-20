@@ -38,6 +38,7 @@ buzz messages thread --link 'buzz://message?channel=<uuid>&id=<event-id>&thread=
 buzz messages search --query "architecture"
 buzz messages search --author <pubkey|npub|name> --since <unix-ts>
 buzz messages edit --event <event-id> --content "Updated text"           # attachments preserved
+buzz messages edit --event <event-id> --content - < replacement.md        # read edit body from stdin
 buzz messages edit --event <event-id> --content "Updated text" --file pic.png  # replace attachments
 buzz messages edit --event <event-id> --content "Updated text" --no-media  # drop all attachments
 buzz messages delete --event <event-id>

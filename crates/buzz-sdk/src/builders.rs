@@ -204,9 +204,25 @@ fn mention_tags(mentions: &[&str], tags: &mut Vec<Tag>) -> Result<(), SdkError> 
     Ok(())
 }
 
-/// Emit imeta tags from raw tag vectors.
+/// Emit validated imeta tags from raw tag vectors.
 fn imeta_tags(media_tags: &[Vec<String>], tags: &mut Vec<Tag>) -> Result<(), SdkError> {
     for mt in media_tags {
+        if mt.first().map(String::as_str) != Some("imeta") {
+            return Err(SdkError::InvalidInput(
+                "media_tags may contain only imeta tags".into(),
+            ));
+        }
+        let has_required = ["url", "m", "x", "size"].iter().all(|required| {
+            mt.iter().skip(1).any(|part| {
+                part.split_once(' ')
+                    .is_some_and(|(key, value)| key == *required && !value.is_empty())
+            })
+        });
+        if !has_required {
+            return Err(SdkError::InvalidInput(
+                "imeta tag must include url, m, x, and size".into(),
+            ));
+        }
         let parts: Vec<&str> = mt.iter().map(String::as_str).collect();
         tags.push(Tag::parse(parts).map_err(|e| SdkError::InvalidTag(e.to_string()))?);
     }
@@ -2752,6 +2768,8 @@ mod tests {
             "imeta".to_string(),
             "url https://example.com/image.png".to_string(),
             "m image/png".to_string(),
+            format!("x {}", "a".repeat(64)),
+            "size 123".to_string(),
         ]];
         let ev = sign(build_edit(cid, eid, "new content", &media_tags).unwrap());
         assert_eq!(ev.kind.as_u16(), 40003);
@@ -2793,6 +2811,32 @@ mod tests {
         let malformed_tags = vec![vec![]];
         let result = build_edit(cid, eid, "new content", &malformed_tags);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_rejects_non_imeta_media_tag() {
+        let result = build_edit(
+            uuid(),
+            event_id(),
+            "new content",
+            &[vec!["p".into(), "a".repeat(64)]],
+        );
+        assert!(matches!(result, Err(SdkError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn edit_rejects_imeta_missing_required_fields() {
+        let result = build_edit(
+            uuid(),
+            event_id(),
+            "new content",
+            &[vec![
+                "imeta".into(),
+                "url https://example.com/image.png".into(),
+                "m image/png".into(),
+            ]],
+        );
+        assert!(matches!(result, Err(SdkError::InvalidInput(_))));
     }
 
     #[test]
