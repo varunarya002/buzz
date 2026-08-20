@@ -174,21 +174,33 @@ fn resolve_names_to_pubkeys(
     Ok(resolved)
 }
 
-/// Extract raw `imeta` tag vectors from a fetched event's JSON tags.
-/// Only `imeta` tags are returned — no other tag kinds are carried.
+/// Match the SDK/relay contract for a single raw `imeta` tag.
+fn is_valid_imeta(parts: &[String]) -> bool {
+    parts.first().map(String::as_str) == Some("imeta")
+        && ["url", "m", "x", "size"].iter().all(|required| {
+            parts.iter().skip(1).any(|part| {
+                part.split_once(' ')
+                    .is_some_and(|(key, value)| key == *required && !value.is_empty())
+            })
+        })
+}
+
+/// Extract valid raw `imeta` tag vectors from a fetched event's JSON tags.
+/// Malformed legacy vectors are omitted so a text-only edit cannot fail SDK
+/// validation while trying to carry attachments forward.
 fn extract_imeta_tags(event: &serde_json::Value) -> Vec<Vec<String>> {
     event
         .get("tags")
         .and_then(|t| t.as_array())
         .map(|tags| {
             tags.iter()
-                .filter_map(|t| t.as_array())
-                .filter(|parts| parts.first().and_then(|v| v.as_str()) == Some("imeta"))
-                .map(|parts| {
-                    parts
+                .filter_map(|tag| {
+                    let parts = tag.as_array()?;
+                    let strings = parts
                         .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
+                        .map(|part| part.as_str().map(String::from))
+                        .collect::<Option<Vec<_>>>()?;
+                    is_valid_imeta(&strings).then_some(strings)
                 })
                 .collect()
         })
@@ -1206,12 +1218,11 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_id_from_event, cmd_get_thread, event_mention_pubkeys, find_root_from_tags,
-        effective_media_source, extract_imeta_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members,
-        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
-        resolve_thread_target, thread_ref_from_event, thread_ref_from_parent_tags, BuzzClient,
-        CliError, Uuid,
+        channel_id_from_event, cmd_get_thread, effective_media_source, event_mention_pubkeys,
+        extract_imeta_tags, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
+        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
+        thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
@@ -1696,22 +1707,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_imeta_tags_returns_only_imeta() {
+    fn extract_imeta_tags_returns_only_valid_imeta() {
+        let valid = json!([
+            "imeta",
+            "url https://example.com/image.png",
+            "m image/png",
+            "x deadbeef",
+            "size 123"
+        ]);
         let event = json!({
             "tags": [
                 ["h", "channel-uuid"],
                 ["e", "event-id", "", "reply"],
-                ["imeta", "url", "https://example.com/image.png", "m", "image/png"],
+                valid.clone(),
                 ["emoji", "🎉"],
-                ["imeta", "url", "https://example.com/video.mp4", "m", "video/mp4"],
+                ["imeta", "url", "https://example.com/legacy.png", "m", "image/png"],
+                ["imeta", "url https://example.com/no-size.png", "m image/png", "x cafe"]
             ]
         });
-        let imeta_tags = extract_imeta_tags(&event);
-        assert_eq!(imeta_tags.len(), 2);
-        // Verify the full imeta vectors are preserved
-        assert_eq!(imeta_tags[0][0], "imeta");
-        assert_eq!(imeta_tags[0][1], "url");
-        assert_eq!(imeta_tags[1][0], "imeta");
+        assert_eq!(
+            extract_imeta_tags(&event),
+            vec![valid
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()]
+        );
     }
 
     #[test]
