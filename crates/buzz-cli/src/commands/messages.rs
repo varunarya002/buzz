@@ -223,17 +223,23 @@ fn effective_media_source<'a>(
         if event.get("kind").and_then(|value| value.as_u64()) != Some(40003) {
             continue;
         }
+        // Match the desktop overlay contract: the last valid `e` tag is the
+        // edit target. The relay's `#e` query is intentionally broad, so an
+        // earlier matching tag must not make an edit authoritative here.
         let targets_original = event
             .get("tags")
             .and_then(|value| value.as_array())
-            .is_some_and(|tags| {
-                tags.iter().any(|tag| {
-                    tag.as_array().is_some_and(|parts| {
-                        parts.first().and_then(|value| value.as_str()) == Some("e")
-                            && parts.get(1).and_then(|value| value.as_str()) == Some(target_id)
-                    })
+            .and_then(|tags| {
+                tags.iter().rev().find_map(|tag| {
+                    let parts = tag.as_array()?;
+                    let candidate = parts.get(1)?.as_str()?;
+                    (parts.first()?.as_str()? == "e"
+                        && candidate.len() == 64
+                        && candidate.chars().all(|ch| ch.is_ascii_hexdigit()))
+                    .then_some(candidate)
                 })
-            });
+            })
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(target_id));
         if !targets_original {
             continue;
         }
@@ -1606,5 +1612,25 @@ mod tests {
         let events = [newer.clone(), older, original.clone()];
         let source = effective_media_source(&original, &events);
         assert_eq!(source.get("id"), newer.get("id"));
+    }
+
+    #[test]
+    fn effective_media_source_uses_the_renderers_last_valid_edit_target() {
+        let original = json!({"id": ID_A, "kind": 9, "created_at": 10, "tags": []});
+        let valid = json!({
+            "id": "valid-edit",
+            "kind": 40003,
+            "created_at": 20,
+            "tags": [["e", ID_A], ["imeta", "url valid"]],
+        });
+        let targets_another_message = json!({
+            "id": "other-target-edit",
+            "kind": 40003,
+            "created_at": 30,
+            "tags": [["e", ID_A], ["e", ID_B], ["imeta", "url wrong"]],
+        });
+        let events = [targets_another_message, valid.clone(), original.clone()];
+        let source = effective_media_source(&original, &events);
+        assert_eq!(source.get("id"), valid.get("id"));
     }
 }
